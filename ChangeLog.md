@@ -20,6 +20,8 @@ See docs/process.md for more on how version tagging works.
 
 3.1.1
 -----
+- Updated SDL 2 port to upstream version 2.0.18 (from a patched 2.0.10). This
+  includes all downstream patches and many upstream changes.
 
 3.1.0 - 12/22/2021
 ------------------
@@ -28,7 +30,7 @@ See docs/process.md for more on how version tagging works.
   For projects targeting older browsers (e.g. `-sMIN_CHROME_VERSION=10`),
   emscripten will now run closure compiler in `WHITESPACE_ONLY` mode in order to
   traspile any ES6 down to ES5.  When this automatic transpilation is performed
-  we generate a warning which can disabled (using `-Wno-transpile`) or by
+  we generate a warning which can be disabled (using `-Wno-transpile`) or by
   explicitly opting in-to or out-of closure using `--closure=1` or
   `--closure=0`. (#15763).
 
