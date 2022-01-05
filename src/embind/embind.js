@@ -17,7 +17,7 @@
 /*global typeDependencies, flushPendingDeletes, getTypeName, getBasestPointer, throwBindingError, UnboundTypeError, _embind_repr, registeredInstances, registeredTypes, getShiftFromSize*/
 /*global ensureOverloadTable, embind__requireFunction, awaitingDependencies, makeLegalFunctionName, embind_charCodes:true, registerType, createNamedFunction, RegisteredPointer, throwInternalError*/
 /*global simpleReadValueFromPointer, floatReadValueFromPointer, integerReadValueFromPointer, enumReadValueFromPointer, replacePublicSymbol, craftInvokerFunction, tupleRegistrations*/
-/*global finalizationRegistry, attachFinalizer, detachFinalizer, releaseClassHandle, runDestructor*/
+/*global finalizationGroup, attachFinalizer, detachFinalizer, releaseClassHandle, runDestructor*/
 /*global ClassHandle, makeClassHandle, structRegistrations, whenDependentTypesAreResolved, BindingError, deletionQueue, delayFunction:true, upcastPointer*/
 /*global exposePublicSymbol, heap32VectorToArray, new_, RegisteredPointer_getPointee, RegisteredPointer_destructor, RegisteredPointer_deleteObject, char_0, char_9*/
 /*global getInheritedInstanceCount, getLiveInheritedInstances, setDelayFunction, InternalError, runDestructors*/
@@ -1740,21 +1740,21 @@ var LibraryEmbind = {
     }
   },
 
-  $finalizationRegistry: false,
+  $finalizationGroup: false,
 
-  $detachFinalizer_deps: ['$finalizationRegistry'],
+  $detachFinalizer_deps: ['$finalizationGroup'],
   $detachFinalizer: function(handle) {},
 
-  $attachFinalizer__deps: ['$finalizationRegistry', '$detachFinalizer',
+  $attachFinalizer__deps: ['$finalizationGroup', '$detachFinalizer',
                            '$releaseClassHandle'],
   $attachFinalizer: function(handle) {
-    if ('undefined' === typeof FinalizationRegistry) {
+    if ('undefined' === typeof FinalizationGroup) {
         attachFinalizer = function (handle) { return handle; };
         return handle;
     }
-    // If the running environment has a FinalizationRegistry (see
+    // If the running environment has a FinalizationGroup (see
     // https://github.com/tc39/proposal-weakrefs), then attach finalizers
-    // for class handles.  We check for the presence of FinalizationRegistry
+    // for class handles.  We check for the presence of FinalizationGroup
     // at run-time, not build-time.
     finalizationRegistry = new FinalizationRegistry(function (info) {
 #if ASSERTIONS
@@ -1787,7 +1787,7 @@ var LibraryEmbind = {
         return handle;
     };
     detachFinalizer = function(handle) {
-        finalizationRegistry.unregister(handle);
+        finalizationGroup.unregister(handle);
     };
     return attachFinalizer(handle);
   },
