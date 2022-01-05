@@ -1769,7 +1769,7 @@ var LibraryEmbind = {
         return handle;
     };
     detachFinalizer = function(handle) {
-        finalizationRegistry.unregister(handle.$$);
+        finalizationRegistry.unregister(handle);
     };
     return attachFinalizer(handle);
   },
