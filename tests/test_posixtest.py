@@ -70,7 +70,6 @@ unsupported_noreturn = {
 unsupported = {
   'test_pthread_attr_setinheritsched_2_2': 'scheduling policy/parameters are not supported',
   'test_pthread_attr_setinheritsched_2_3': 'scheduling policy/parameters are not supported',
-  'test_pthread_attr_setinheritsched_2_3': 'scheduling policy/parameters are not supported',
   'test_pthread_attr_setinheritsched_2_4': 'scheduling policy/parameters are not supported',
   'test_pthread_attr_setschedparam_1_3': 'scheduling policy/parameters are not supported',
   'test_pthread_attr_setschedparam_1_4': 'scheduling policy/parameters are not supported',
@@ -129,6 +128,8 @@ flaky = {
   'test_pthread_cond_signal_1_1': 'flaky: https://github.com/emscripten-core/emscripten/issues/13283',
   'test_pthread_barrier_wait_2_1': 'flaky: https://github.com/emscripten-core/emscripten/issues/14508',
   'test_pthread_rwlock_unlock_3_1': 'Test fail: writer did not get write lock, when main release the lock',
+  'test_pthread_mutex_init_1_2': 'flaky: https://github.com/emscripten-core/posixtestsuite/pull/9',
+  'test_pthread_mutex_init_3_2': 'flaky: https://github.com/emscripten-core/posixtestsuite/pull/9',
 }
 
 # Mark certain tests as disabled.  These are tests that are either flaky or never return.

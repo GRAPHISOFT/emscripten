@@ -17,7 +17,7 @@
 /*global typeDependencies, flushPendingDeletes, getTypeName, getBasestPointer, throwBindingError, UnboundTypeError, _embind_repr, registeredInstances, registeredTypes, getShiftFromSize*/
 /*global ensureOverloadTable, embind__requireFunction, awaitingDependencies, makeLegalFunctionName, embind_charCodes:true, registerType, createNamedFunction, RegisteredPointer, throwInternalError*/
 /*global simpleReadValueFromPointer, floatReadValueFromPointer, integerReadValueFromPointer, enumReadValueFromPointer, replacePublicSymbol, craftInvokerFunction, tupleRegistrations*/
-/*global finalizationRegistry, attachFinalizer, detachFinalizer, releaseClassHandle, runDestructor*/
+/*global finalizationGroup, attachFinalizer, detachFinalizer, releaseClassHandle, runDestructor*/
 /*global ClassHandle, makeClassHandle, structRegistrations, whenDependentTypesAreResolved, BindingError, deletionQueue, delayFunction:true, upcastPointer*/
 /*global exposePublicSymbol, heap32VectorToArray, new_, RegisteredPointer_getPointee, RegisteredPointer_destructor, RegisteredPointer_deleteObject, char_0, char_9*/
 /*global getInheritedInstanceCount, getLiveInheritedInstances, setDelayFunction, InternalError, runDestructors*/
@@ -50,6 +50,9 @@ var LibraryEmbind = {
     Module['flushPendingDeletes'] = flushPendingDeletes;
     Module['setDelayFunction'] = setDelayFunction;
 #if IN_TEST_HARNESS
+#if ASSERTIONS
+    Module['ASSERTIONS'] = true;
+#endif
 #if DYNAMIC_EXECUTION
     // Without dynamic execution, dynamically created functions will have no
     // names. This lets the test suite know that.
@@ -569,21 +572,34 @@ var LibraryEmbind = {
     }
 
     var isUnsignedType = (name.includes('unsigned'));
-
+    var checkAssertions = function(value, toTypeName) {
+#if ASSERTIONS
+        if (typeof value !== "number" && typeof value !== "boolean") {
+            throw new TypeError('Cannot convert "' + _embind_repr(value) + '" to ' + toTypeName);
+        }
+        if (value < minRange || value > maxRange) {
+            throw new TypeError('Passing a number "' + _embind_repr(value) + '" from JS side to C/C++ side to an argument of type "' + name + '", which is outside the valid range [' + minRange + ', ' + maxRange + ']!');
+        }
+#endif
+    }
+    var toWireType;
+    if (isUnsignedType) {
+        toWireType = function(destructors, value) {
+            checkAssertions(value, this.name);
+            return value >>> 0;
+        }
+    } else {
+        toWireType = function(destructors, value) {
+            checkAssertions(value, this.name);
+            // The VM will perform JS to Wasm value conversion, according to the spec:
+            // https://www.w3.org/TR/wasm-js-api-1/#towebassemblyvalue
+            return value;
+        }
+    }
     registerType(primitiveType, {
         name: name,
         'fromWireType': fromWireType,
-        'toWireType': function(destructors, value) {
-            // todo: Here we have an opportunity for -O3 level "unsafe" optimizations: we could
-            // avoid the following two if()s and assume value is of proper type.
-            if (typeof value !== "number" && typeof value !== "boolean") {
-                throw new TypeError('Cannot convert "' + _embind_repr(value) + '" to ' + this.name);
-            }
-            if (value < minRange || value > maxRange) {
-                throw new TypeError('Passing a number "' + _embind_repr(value) + '" from JS side to C/C++ side to an argument of type "' + name + '", which is outside the valid range [' + minRange + ', ' + maxRange + ']!');
-            }
-            return isUnsignedType ? (value >>> 0) : (value | 0);
-        },
+        'toWireType': toWireType,
         'argPackAdvance': 8,
         'readValueFromPointer': integerReadValueFromPointer(name, shift, minRange !== 0),
         destructorFunction: null, // This type does not need a destructor
@@ -602,23 +618,23 @@ var LibraryEmbind = {
 
     // maxRange comes through as -1 for uint64_t (see issue 13902). Work around that temporarily
     if (isUnsignedType) {
-      // Use string because acorn does recognize bigint literals
-      maxRange = (BigInt(1) << BigInt(64)) - BigInt(1);
+        // Use string because acorn does recognize bigint literals
+        maxRange = (BigInt(1) << BigInt(64)) - BigInt(1);
     }
 
     registerType(primitiveType, {
         name: name,
         'fromWireType': function (value) {
-          return value;
+            return value;
         },
         'toWireType': function (destructors, value) {
-          if (typeof value !== "bigint") {
-            throw new TypeError('Cannot convert "' + _embind_repr(value) + '" to ' + this.name);
-          }
-          if (value < minRange || value > maxRange) {
-            throw new TypeError('Passing a number "' + _embind_repr(value) + '" from JS side to C/C++ side to an argument of type "' + name + '", which is outside the valid range [' + minRange + ', ' + maxRange + ']!');
-          }
-          return value;
+            if (typeof value !== "bigint") {
+                throw new TypeError('Cannot convert "' + _embind_repr(value) + '" to ' + this.name);
+            }
+            if (value < minRange || value > maxRange) {
+                throw new TypeError('Passing a number "' + _embind_repr(value) + '" from JS side to C/C++ side to an argument of type "' + name + '", which is outside the valid range [' + minRange + ', ' + maxRange + ']!');
+            }
+            return value;
         },
         'argPackAdvance': 8,
         'readValueFromPointer': integerReadValueFromPointer(name, shift, !isUnsignedType),
@@ -639,14 +655,16 @@ var LibraryEmbind = {
     registerType(rawType, {
         name: name,
         'fromWireType': function(value) {
-            return value;
+             return value;
         },
         'toWireType': function(destructors, value) {
-            // todo: Here we have an opportunity for -O3 level "unsafe" optimizations: we could
-            // avoid the following if() and assume value is of proper type.
+#if ASSERTIONS
             if (typeof value !== "number" && typeof value !== "boolean") {
                 throw new TypeError('Cannot convert "' + _embind_repr(value) + '" to ' + this.name);
             }
+#endif
+            // The VM will perform JS to Wasm value conversion, according to the spec:
+            // https://www.w3.org/TR/wasm-js-api-1/#towebassemblyvalue
             return value;
         },
         'argPackAdvance': 8,
@@ -1008,11 +1026,11 @@ var LibraryEmbind = {
       invokerFuncArgs.length = isClassMethodFunc ? 2 : 1;
       invokerFuncArgs[0] = cppTargetFunc;
       if (isClassMethodFunc) {
-        thisWired = argTypes[1].toWireType(destructors, this);
+        thisWired = argTypes[1]['toWireType'](destructors, this);
         invokerFuncArgs[1] = thisWired;
       }
       for (var i = 0; i < expectedArgCount; ++i) {
-        argsWired[i] = argTypes[i + 2].toWireType(destructors, arguments[i]);
+        argsWired[i] = argTypes[i + 2]['toWireType'](destructors, arguments[i]);
         invokerFuncArgs.push(argsWired[i]);
       }
 
@@ -1035,7 +1053,7 @@ var LibraryEmbind = {
   #endif
 
         if (returns) {
-          return argTypes[0].fromWireType(rv);
+          return argTypes[0]['fromWireType'](rv);
         }
       }
 
@@ -1722,21 +1740,21 @@ var LibraryEmbind = {
     }
   },
 
-  $finalizationRegistry: false,
+  $finalizationGroup: false,
 
-  $detachFinalizer_deps: ['$finalizationRegistry'],
+  $detachFinalizer_deps: ['$finalizationGroup'],
   $detachFinalizer: function(handle) {},
 
-  $attachFinalizer__deps: ['$finalizationRegistry', '$detachFinalizer',
+  $attachFinalizer__deps: ['$finalizationGroup', '$detachFinalizer',
                            '$releaseClassHandle'],
   $attachFinalizer: function(handle) {
-    if ('undefined' === typeof FinalizationRegistry) {
+    if ('undefined' === typeof FinalizationGroup) {
         attachFinalizer = function (handle) { return handle; };
         return handle;
     }
-    // If the running environment has a FinalizationRegistry (see
+    // If the running environment has a FinalizationGroup (see
     // https://github.com/tc39/proposal-weakrefs), then attach finalizers
-    // for class handles.  We check for the presence of FinalizationRegistry
+    // for class handles.  We check for the presence of FinalizationGroup
     // at run-time, not build-time.
     finalizationRegistry = new FinalizationRegistry(function (info) {
 #if ASSERTIONS
@@ -1769,7 +1787,7 @@ var LibraryEmbind = {
         return handle;
     };
     detachFinalizer = function(handle) {
-        finalizationRegistry.unregister(handle);
+        finalizationGroup.unregister(handle);
     };
     return attachFinalizer(handle);
   },

@@ -85,7 +85,9 @@ import argparse
 import tempfile
 import subprocess
 
-sys.path.insert(1, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+__scriptdir__ = os.path.dirname(os.path.abspath(__file__))
+__rootdir__ = os.path.dirname(__scriptdir__)
+sys.path.append(__rootdir__)
 
 from tools import shared
 from tools import system_libs
@@ -173,7 +175,7 @@ def parse_c_output(lines):
 
 def gen_inspect_code(path, struct, code):
   if path[0][-1] == '#':
-    path[0] = path[0][:-1]
+    path[0] = path[0].rstrip('#')
     prefix = ''
   else:
     prefix = 'struct '
@@ -426,6 +428,7 @@ def main(args):
 
   internal_cflags = [
     '-I' + utils.path_from_root('system/lib/libc/musl/src/internal'),
+    '-I' + utils.path_from_root('system/lib/libc/musl/src/include'),
   ]
 
   cxxflags = [

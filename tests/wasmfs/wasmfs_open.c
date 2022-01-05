@@ -10,6 +10,7 @@
 #include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 // FIXME: Merge with other existing close and open tests.
@@ -28,6 +29,18 @@ int main() {
 
   dprintf(fd2, "WORKING WITHOUT TRAILING BACKSLASH\n");
 
+  // Check that the file type is correct on mode.
+  struct stat file;
+  fstat(fd2, &file);
+
+  assert((file.st_mode & S_IFMT) == S_IFCHR);
+  // The JS file system assigns S_IWUGO | S_IRUGO | S_IFCHR to devices.
+#ifdef WASMFS
+  assert(file.st_mode == (S_IWUGO | S_IFCHR));
+#else
+  assert(file.st_mode == (S_IWUGO | S_IRUGO | S_IFCHR));
+#endif
+
   // Close open file
   close(fd2);
 
@@ -38,14 +51,25 @@ int main() {
   printf("Errno: %s\n", strerror(errno));
 
   // Attempt to open and then read/write to a directory.
-  int fd3 = open("/dev", O_RDONLY);
+  int fd3 = open("/dev", O_RDONLY | O_DIRECTORY);
+
+  // Check that the file type is correct on mode.
+  struct stat dir;
+  fstat(fd3, &dir);
+
+  assert((dir.st_mode & S_IFMT) == S_IFDIR);
+  // The JS file system assigns write access to /dev.
+#ifdef WASMFS
+  assert(dir.st_mode == (S_IRUGO | S_IXUGO | S_IFDIR));
+#else
+  assert(dir.st_mode == (S_IWUGO | S_IRUGO | S_IXUGO | S_IFDIR));
+#endif
 
   const char* msg = "Test\n";
 
   errno = 0;
   write(fd3, msg, strlen(msg));
   // TODO: Change to assert(errno == EBADF) when access mode checking is added.
-  printf("Errno: %s\n", strerror(errno));
 
   char buf[100];
 
@@ -64,19 +88,29 @@ int main() {
   // Attempt to open a file path with a file intermediary.
   int fd5 = open("/dev/stdout/foo", O_RDWR);
   printf("Errno: %s\n", strerror(errno));
+  // Both errors are valid, but in WasmFS, ENOTDIR is returned first.
+#ifdef WASMFS
   assert(errno == ENOTDIR);
+#else
+  assert(errno == ENOENT);
+#endif
 
   errno = 0;
   // Attempt to open and write to the root directory.
   int fd6 = open("/", O_RDONLY);
   write(fd6, msg, strlen(msg));
   printf("Errno: %s\n", strerror(errno));
+  // In Linux and WasmFS one can obtain a fd to a directory.
+#ifdef WASMFS
   assert(errno == EISDIR);
+#else
+  assert(errno == EBADF);
+#endif
 
   errno = 0;
   // Attempt to open a blank path.
   int fd7 = open("", O_RDONLY);
-  assert(errno == EINVAL);
+  assert(errno == ENOENT);
 
   return 0;
 }

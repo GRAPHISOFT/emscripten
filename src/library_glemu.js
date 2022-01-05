@@ -1240,7 +1240,7 @@ var LibraryGLEmulation = {
         }
         this.computeKey1 = function() {
           var k = this.traverseKey;
-          key = k[this.colorOp[0]] * 4096;
+          var key = k[this.colorOp[0]] * 4096;
           key += k[this.colorOp[1]] * 1024;
           key += k[this.colorOp[2]] * 256;
           key += k[this.alphaOp[0]] * 16;
@@ -3934,7 +3934,7 @@ var LibraryGLEmulation = {
   },
 
   gluUnProject: function(winX, winY, winZ, model, proj, view, objX, objY, objZ) {
-    var result = GLImmediate.matrixLib.mat4.unproject([winX, winY, winZ],
+    var result = GLImmediate.matrixLib.vec3.unproject([winX, winY, winZ],
         {{{ makeHEAPView('F64', 'model', 'model+' + (16*8)) }}},
         {{{ makeHEAPView('F64', 'proj', 'proj+' + (16*8)) }}},
         {{{ makeHEAPView('32', 'view', 'view+' + (4*4)) }}});

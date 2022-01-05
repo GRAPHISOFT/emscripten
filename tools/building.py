@@ -39,7 +39,7 @@ logger = logging.getLogger('building')
 #  Building
 binaryen_checked = False
 
-EXPECTED_BINARYEN_VERSION = 101
+EXPECTED_BINARYEN_VERSION = 103
 # cache results of nm - it can be slow to run
 nm_cache = {}
 # Stores the object files contained in different archive files passed as input
@@ -245,9 +245,12 @@ def llvm_backend_args():
     allowed = ','.join(settings.EXCEPTION_CATCHING_ALLOWED)
     args += ['-emscripten-cxx-exceptions-allowed=' + allowed]
 
-  if settings.SUPPORT_LONGJMP:
-    # asm.js-style setjmp/longjmp handling
+  # asm.js-style setjmp/longjmp handling
+  if settings.SUPPORT_LONGJMP == 'emscripten':
     args += ['-enable-emscripten-sjlj']
+  # setjmp/longjmp handling using Wasm EH
+  elif settings.SUPPORT_LONGJMP == 'wasm':
+    args += ['-wasm-enable-sjlj']
 
   # better (smaller, sometimes faster) codegen, see binaryen#1054
   # and https://bugs.llvm.org/show_bug.cgi?id=39488
@@ -294,24 +297,28 @@ def lld_flags_for_executable(external_symbols):
   # section and DWARF, so we can only use it when we don't need any of
   # those things.
   if settings.DEBUG_LEVEL < 2 and (not settings.EMIT_SYMBOL_MAP and
-                                   not settings.PROFILING_FUNCS and
+                                   not settings.EMIT_NAME_SECTION and
                                    not settings.ASYNCIFY):
     cmd.append('--strip-debug')
 
   if settings.LINKABLE:
-    cmd.append('--export-all')
+    cmd.append('--export-dynamic')
     cmd.append('--no-gc-sections')
-  else:
-    c_exports = [e for e in settings.EXPORTED_FUNCTIONS if is_c_symbol(e)]
-    # Strip the leading underscores
-    c_exports = [demangle_c_symbol_name(e) for e in c_exports]
-    if external_symbols:
-      # Filter out symbols external/JS symbols
-      c_exports = [e for e in c_exports if e not in external_symbols]
-    for export in c_exports:
-      cmd.append('--export-if-defined=' + export)
 
-    for export in settings.EXPORT_IF_DEFINED:
+  c_exports = [e for e in settings.EXPORTED_FUNCTIONS if is_c_symbol(e)]
+  # Strip the leading underscores
+  c_exports = [demangle_c_symbol_name(e) for e in c_exports]
+  c_exports += settings.EXPORT_IF_DEFINED
+  if external_symbols:
+    # Filter out symbols external/JS symbols
+    c_exports = [e for e in c_exports if e not in external_symbols]
+  for export in c_exports:
+    cmd.append('--export-if-defined=' + export)
+
+  for export in settings.REQUIRED_EXPORTS:
+    if settings.ERROR_ON_UNDEFINED_SYMBOLS:
+      cmd.append('--export=' + export)
+    else:
       cmd.append('--export-if-defined=' + export)
 
   if settings.RELOCATABLE:
@@ -376,10 +383,10 @@ def link_lld(args, target, external_symbols=None):
   for a in llvm_backend_args():
     cmd += ['-mllvm', a]
 
-  # Wasm exception handling. This is a CodeGen option for the LLVM backend, so
-  # wasm-ld needs to take this for the LTO mode.
   if settings.EXCEPTION_HANDLING:
-    cmd += ['-mllvm', '-exception-model=wasm', '-mllvm', '-wasm-enable-eh']
+    cmd += ['-mllvm', '-wasm-enable-eh']
+  if settings.EXCEPTION_HANDLING or settings.SUPPORT_LONGJMP == 'wasm':
+    cmd += ['-mllvm', '-exception-model=wasm']
 
   # For relocatable output (generating an object file) we don't pass any of the
   # normal linker flags that are used when building and exectuable
@@ -391,6 +398,7 @@ def link_lld(args, target, external_symbols=None):
 
 
 def link_bitcode(args, target, force_archive_contents=False):
+  diagnostics.warning('deprecated', 'bitcode linking with llvm-link is deprecated.  Please use emar archives instead.  See https://github.com/emscripten-core/emscripten/issues/13492')
   # "Full-featured" linking: looks into archives (duplicates lld functionality)
   input_files = [a for a in args if not a.startswith('-')]
   files_to_link = []
@@ -583,12 +591,9 @@ def parse_llvm_nm_symbols(output):
 
 def emar(action, output_filename, filenames, stdout=None, stderr=None, env=None):
   try_delete(output_filename)
-  response_filename = response_file.create_response_file(filenames, TEMP_DIR)
-  cmd = [EMAR, action, output_filename] + ['@' + response_filename]
-  try:
-    run_process(cmd, stdout=stdout, stderr=stderr, env=env)
-  finally:
-    try_delete(response_filename)
+  cmd = [EMAR, action, output_filename] + filenames
+  cmd = get_command_with_possible_response_file(cmd)
+  run_process(cmd, stdout=stdout, stderr=stderr, env=env)
 
   if 'c' in action:
     assert os.path.exists(output_filename), 'emar could not create output file: ' + output_filename
@@ -681,12 +686,12 @@ def check_closure_compiler(cmd, args, env, allowed_to_fail):
     if isinstance(e, subprocess.CalledProcessError):
       sys.stderr.write(e.stdout)
     sys.stderr.write(str(e) + '\n')
-    exit_with_error('closure compiler ("%s --version") did not execute properly!' % str(cmd))
+    exit_with_error('closure compiler (%s) did not execute properly!' % shared.shlex_join(cmd))
 
   if 'Version:' not in output:
     if allowed_to_fail:
       return False
-    exit_with_error('unrecognized closure compiler --version output (%s):\n%s' % (str(cmd), output))
+    exit_with_error('unrecognized closure compiler --version output (%s):\n%s' % (shared.shlex_join(cmd), output))
 
   return True
 
@@ -702,16 +707,8 @@ def isascii(s):
     return True
 
 
-@ToolchainProfiler.profile_block('closure_compiler')
-def closure_compiler(filename, pretty, advanced=True, extra_closure_args=None):
+def get_closure_compiler_and_env(user_args):
   env = shared.env_with_node_in_path()
-  user_args = []
-  env_args = os.environ.get('EMCC_CLOSURE_ARGS')
-  if env_args:
-    user_args += shlex.split(env_args)
-  if extra_closure_args:
-    user_args += extra_closure_args
-
   closure_cmd = get_closure_compiler()
 
   native_closure_compiler_works = check_closure_compiler(closure_cmd, user_args, env, allowed_to_fail=True)
@@ -731,6 +728,29 @@ def closure_compiler(filename, pretty, advanced=True, extra_closure_args=None):
       add_to_path(java_bin)
       java_home = os.path.dirname(java_bin)
       env.setdefault('JAVA_HOME', java_home)
+
+  return closure_cmd, env
+
+
+@ToolchainProfiler.profile_block('closure_transpile')
+def closure_transpile(filename, pretty):
+  user_args = []
+  closure_cmd, env = get_closure_compiler_and_env(user_args)
+  closure_cmd += ['--language_out', 'ES5']
+  closure_cmd += ['--compilation_level', 'WHITESPACE_ONLY']
+  return run_closure_cmd(closure_cmd, filename, env, pretty)
+
+
+@ToolchainProfiler.profile_block('closure_compiler')
+def closure_compiler(filename, pretty, advanced=True, extra_closure_args=None):
+  user_args = []
+  env_args = os.environ.get('EMCC_CLOSURE_ARGS')
+  if env_args:
+    user_args += shlex.split(env_args)
+  if extra_closure_args:
+    user_args += extra_closure_args
+
+  closure_cmd, env = get_closure_compiler_and_env(user_args)
 
   # Closure externs file contains known symbols to be extern to the minification, Closure
   # should not minify these symbol names.
@@ -775,7 +795,7 @@ def closure_compiler(filename, pretty, advanced=True, extra_closure_args=None):
     CLOSURE_EXTERNS += [path_from_root('src/closure-externs/dyncall-externs.js')]
 
   if settings.MINIMAL_RUNTIME and settings.USE_PTHREADS:
-    CLOSURE_EXTERNS += [path_from_root('src/minimal_runtime_worker_externs.js')]
+    CLOSURE_EXTERNS += [path_from_root('src/closure-externs/minimal_runtime_worker_externs.js')]
 
   args = ['--compilation_level', 'ADVANCED_OPTIMIZATIONS' if advanced else 'SIMPLE_OPTIMIZATIONS']
   # Keep in sync with ecmaVersion in tools/acorn-optimizer.js
@@ -783,40 +803,50 @@ def closure_compiler(filename, pretty, advanced=True, extra_closure_args=None):
   # Tell closure not to do any transpiling or inject any polyfills.
   # At some point we may want to look into using this as way to convert to ES5 but
   # babel is perhaps a better tool for that.
-  args += ['--language_out', 'NO_TRANSPILE']
+  if settings.TRANSPILE_TO_ES5:
+    args += ['--language_out', 'ES5']
+  else:
+    args += ['--language_out', 'NO_TRANSPILE']
   # Tell closure never to inject the 'use strict' directive.
   args += ['--emit_use_strict=false']
+
+  if settings.IGNORE_CLOSURE_COMPILER_ERRORS:
+    args.append('--jscomp_off=*')
+  # Specify input file relative to the temp directory to avoid specifying non-7-bit-ASCII path names.
+  for e in CLOSURE_EXTERNS:
+    args += ['--externs', e]
+  args += user_args
+
+  cmd = closure_cmd + args
+  return run_closure_cmd(cmd, filename, env, pretty=pretty)
+
+
+def run_closure_cmd(cmd, filename, env, pretty):
+  cmd += ['--js', filename]
 
   # Closure compiler is unable to deal with path names that are not 7-bit ASCII:
   # https://github.com/google/closure-compiler/issues/3784
   tempfiles = configuration.get_temp_files()
-  outfile = tempfiles.get('.cc.js').name  # Safe 7-bit filename
 
   def move_to_safe_7bit_ascii_filename(filename):
     if isascii(filename):
-      return filename
+      return os.path.abspath(filename)
     safe_filename = tempfiles.get('.js').name  # Safe 7-bit filename
     shutil.copyfile(filename, safe_filename)
     return os.path.relpath(safe_filename, tempfiles.tmpdir)
 
-  for e in CLOSURE_EXTERNS:
-    args += ['--externs', move_to_safe_7bit_ascii_filename(e)]
+  for i in range(len(cmd)):
+    if cmd[i] == '--externs' or cmd[i] == '--js':
+      cmd[i + 1] = move_to_safe_7bit_ascii_filename(cmd[i + 1])
 
-  for i in range(len(user_args)):
-    if user_args[i] == '--externs':
-      user_args[i + 1] = move_to_safe_7bit_ascii_filename(user_args[i + 1])
+  outfile = tempfiles.get('.cc.js').name  # Safe 7-bit filename
 
   # Specify output file relative to the temp directory to avoid specifying non-7-bit-ASCII path names.
-  args += ['--js_output_file', os.path.relpath(outfile, tempfiles.tmpdir)]
-
-  if settings.IGNORE_CLOSURE_COMPILER_ERRORS:
-    args.append('--jscomp_off=*')
+  cmd += ['--js_output_file', os.path.relpath(outfile, tempfiles.tmpdir)]
   if pretty:
-    args += ['--formatting', 'PRETTY_PRINT']
-  # Specify input file relative to the temp directory to avoid specifying non-7-bit-ASCII path names.
-  args += ['--js', move_to_safe_7bit_ascii_filename(filename)]
-  cmd = closure_cmd + args + user_args
-  logger.debug(f'closure compiler: {shared.shlex_join(cmd)}')
+    cmd += ['--formatting', 'PRETTY_PRINT']
+
+  shared.print_compiler_stage(cmd)
 
   # Closure compiler does not work if any of the input files contain characters outside the
   # 7-bit ASCII range. Therefore make sure the command line we pass does not contain any such

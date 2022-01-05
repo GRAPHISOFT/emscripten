@@ -18,10 +18,13 @@
 // TODO(sbc): Should these be in their own header to avoid emmalloc here?
 #include <emscripten/emmalloc.h>
 
+#define STACK_ALIGN 16
+
 // See musl's pthread_create.c
 
 extern int __pthread_create_js(struct pthread *thread, const pthread_attr_t *attr, void *(*start_routine) (void *), void *arg);
-extern void _emscripten_thread_init(int, int, int);
+extern void _emscripten_thread_init(int, int, int, int);
+extern int _emscripten_default_pthread_stack_size();
 extern void __pthread_detached_exit();
 extern void* _emscripten_tls_base();
 extern int8_t __dso_handle;
@@ -68,7 +71,10 @@ static long dummy_getpid() {
 }
 weak_alias(dummy_getpid, __syscall_getpid);
 
-int __pthread_create(pthread_t *restrict res, const pthread_attr_t *restrict attrp, void *(*entry)(void *), void *restrict arg) {
+int __pthread_create(pthread_t* restrict res,
+                     const pthread_attr_t* restrict attrp,
+                     void* (*entry)(void*),
+                     void* restrict arg) {
   // Note on LSAN: lsan intercepts/wraps calls to pthread_create so any
   // allocation we we do here should be considered leaks.
   // See: lsan_interceptors.cpp.
@@ -92,6 +98,8 @@ int __pthread_create(pthread_t *restrict res, const pthread_attr_t *restrict att
     libc.threaded = 1;
   }
 
+  struct pthread *self = __pthread_self();
+
   // Allocate thread block (pthread_t structure).
   struct pthread *new = malloc(sizeof(struct pthread));
   // zero-initialize thread structure.
@@ -111,8 +119,62 @@ int __pthread_create(pthread_t *restrict res, const pthread_attr_t *restrict att
   new->tsd = malloc(PTHREAD_KEYS_MAX * sizeof(void*));
   memset(new->tsd, 0, PTHREAD_KEYS_MAX * sizeof(void*));
 
+  new->detach_state = DT_JOINABLE;
+
+  if (attrp && attrp != __ATTRP_C11_THREAD) {
+    if (attrp->_a_detach) {
+      new->detach_state = DT_DETACHED;
+    }
+    new->stack_size = attrp->_a_stacksize;
+    new->stack = (void*)attrp->_a_stackaddr;
+  } else {
+    new->stack_size = _emscripten_default_pthread_stack_size();
+  }
+
+  if (!new->stack) {
+    char* stackBase = memalign(STACK_ALIGN, new->stack_size);
+    // musl stores top of the stack in pthread_t->stack (i.e. the high
+    // end from which it grows down).
+    new->stack = stackBase + new->stack_size;
+    new->stack_owned = 1;
+  }
+
+  //printf("start __pthread_create: %p\n", self);
+  int rtn = __pthread_create_js(new, attrp, entry, arg);
+  if (rtn != 0)
+    return rtn;
+
+  // TODO(sbc): Implement circular list of threads
+  /*
+  __tl_lock();
+
+  new->next = self->next;
+  new->prev = self;
+  new->next->prev = new;
+  new->prev->next = new;
+
+  __tl_unlock();
+  */
+
   *res = new;
-  return __pthread_create_js(new, attrp, entry, arg);
+  //printf("done __pthread_create self=%p next=%p prev=%p new=%p\n", self, self->next, self->prev, new);
+  return 0;
+}
+
+/*
+ * Called from JS main thread to free data accociated a thread
+ * that is no longer running.
+ */
+void _emscripten_thread_free_data(pthread_t t) {
+  if (t->profilerBlock) {
+    emscripten_builtin_free(t->profilerBlock);
+  }
+  if (t->stack_owned) {
+    emscripten_builtin_free(((char*)t->stack) - t->stack_size);
+  }
+  // To aid in debugging set all fields to zero
+  memset(t, 0, sizeof(*t));
+  emscripten_builtin_free(t);
 }
 
 static void free_tls_data() {
@@ -141,7 +203,16 @@ void _emscripten_thread_exit(void* result) {
 
   free_tls_data();
 
-  __lock(self->exitlock);
+  // TODO(sbc): Implement circular list of threads
+  /*
+  __tl_lock();
+
+  self->next->prev = self->prev;
+  self->prev->next = self->next;
+  self->prev = self->next = self;
+
+  __tl_unlock();
+  */
 
   if (self == emscripten_main_browser_thread_id()) {
     exit(0);
@@ -154,20 +225,22 @@ void _emscripten_thread_exit(void* result) {
   self->tsd = NULL;
 
   // Not hosting a pthread anymore in this worker set __pthread_self to NULL
-  _emscripten_thread_init(0, 0, 0);
+  _emscripten_thread_init(0, 0, 0, 1);
 
-  // Cache deteched state since once we set threadStatus to 1, the `self` struct
-  // could be freed and reused.
-  int detatched = self->detached;
+  /* This atomic potentially competes with a concurrent pthread_detach
+   * call; the loser is responsible for freeing thread resources. */
+  int state = a_cas(&self->detach_state, DT_JOINABLE, DT_EXITING);
 
-  // Mark the thread as no longer running so it can be joined.
-  // Once we publish this, any threads that are waiting to join with us can
-  // proceed and this worker can be recycled and used on another thread.
-  self->threadStatus = 1;
-  emscripten_futex_wake(&self->threadStatus, INT_MAX); // wake all threads
-
-  if (detatched) {
+  // Mark the thread as no longer running.
+  // When we publish this, the main thread is free to deallocate the thread
+  // object and we are done.
+  if (state == DT_DETACHED) {
+    self->detach_state = DT_EXITED;
     __pthread_detached_exit();
+  } else {
+    self->detach_state = DT_EXITING;
+    // wake any threads that might be waiting for us to exit
+    emscripten_futex_wake(&self->detach_state, INT_MAX);
   }
 }
 

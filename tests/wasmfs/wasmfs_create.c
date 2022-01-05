@@ -10,6 +10,7 @@
 #include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 // FIXME: Merge with other existing close and open tests.
@@ -17,7 +18,16 @@
 int main() {
   // Test creating a new file and writing and reading from it.
   errno = 0;
-  int fd = open("/test", O_RDWR | O_CREAT);
+  int fd = open("/test", O_RDWR | O_CREAT, 0777);
+
+  // Check that the file type is correct on mode.
+  struct stat file;
+  fstat(fd, &file);
+
+  assert((file.st_mode & S_IFMT) == S_IFREG);
+  printf("mode %i\n", file.st_mode);
+  assert(file.st_mode == (S_IRWXUGO | S_IFREG));
+
   assert(errno == 0);
   const char* msg = "Test\n";
   errno = 0;
@@ -76,6 +86,17 @@ int main() {
   printf("Read %zi bytes\n", read(fd7, buf3, sizeof buf3));
   printf("File contents: %s", buf3);
   assert(errno == 0);
+
+  // Try to make a file with a name that is greater than WASMFS_NAME_MAX.
+  errno = 0;
+  open("00000000010000000002000000000300000000040000000005000000000600000000070"
+       "00000000800000000090000000000000000000100000000020000000003000000000400"
+       "00000005000000000600000000070000000008000000000900000000000000000001000"
+       "0000002000000000300000000040000000005123456",
+       O_RDWR);
+#ifdef WASMFS
+  assert(errno == ENAMETOOLONG);
+#endif
 
   // TODO: use seek to test out of bounds read.
 

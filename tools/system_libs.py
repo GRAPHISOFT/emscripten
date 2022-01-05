@@ -15,7 +15,7 @@ from glob import iglob
 from . import shared, building, utils
 from . import deps_info, tempfiles
 from . import diagnostics
-from tools.shared import mangle_c_symbol_name, demangle_c_symbol_name
+from tools.shared import demangle_c_symbol_name
 from tools.settings import settings
 
 logger = logging.getLogger('system_libs')
@@ -36,7 +36,7 @@ def files_in_path(path, filenames):
 def glob_in_path(path, glob_pattern, excludes=()):
   srcdir = utils.path_from_root(path)
   files = iglob(os.path.join(srcdir, glob_pattern), recursive=True)
-  return [f for f in files if os.path.basename(f) not in excludes]
+  return sorted(f for f in files if os.path.basename(f) not in excludes)
 
 
 def get_base_cflags(force_object_files=False):
@@ -75,6 +75,7 @@ def run_build_commands(commands):
 def create_lib(libname, inputs):
   """Create a library from a set of input objects."""
   suffix = shared.suffix(libname)
+  inputs = sorted(inputs, key=lambda x: os.path.basename(x))
   if suffix in ('.bc', '.o'):
     if len(inputs) == 1:
       if inputs[0] != libname:
@@ -86,7 +87,7 @@ def create_lib(libname, inputs):
     building.emar('cr', libname, inputs)
 
 
-def get_wasm_libc_rt_files():
+def get_libc_rt_files(is_optz=False, superset=False):
   # Combining static linking with LTO is tricky under LLVM.  The codegen that
   # happens during LTO can generate references to new symbols that didn't exist
   # in the linker inputs themselves.
@@ -102,17 +103,38 @@ def get_wasm_libc_rt_files():
   # Note that this also includes things that may be depended on by those
   # functions - fmin uses signbit, for example, so signbit must be here (so if
   # fmin is added by codegen, it will have all it needs).
-  math_files = files_in_path(
-    path='system/lib/libc/musl/src/math',
-    filenames=[
-      'fmin.c', 'fminf.c', 'fminl.c',
-      'fmax.c', 'fmaxf.c', 'fmaxl.c',
-      'fmod.c', 'fmodf.c', 'fmodl.c',
-      'log2.c', 'log2f.c', 'log10.c', 'log10f.c',
-      'exp2.c', 'exp2f.c', 'exp10.c', 'exp10f.c',
-      'scalbn.c', '__fpclassifyl.c',
-      '__signbitl.c', '__signbitf.c', '__signbit.c'
-    ])
+  #
+  # This function is called from two different places:
+  # 1. From libc-rt to decide which files to include.  We pass is_optz if we
+  #    are building the size-optimized version of the library.
+  # 2. From the libc library to decide which files to ignore.  Here is pass
+  #    `superset=True` since we want ignore the superset all files that might
+  #    be part of libc-rt (size-optimized or otherwise).
+  math_files = [
+    'fmin.c', 'fminf.c', 'fminl.c',
+    'fmax.c', 'fmaxf.c', 'fmaxl.c',
+    'fmod.c', 'fmodf.c', 'fmodl.c',
+    'logf.c', 'logf_data.c',
+    'log2f.c', 'log2f_data.c',
+    'log10.c', 'log10f.c',
+    'exp.c', 'exp_data.c',
+    'exp2.c',
+    'exp2f.c', 'exp2f_data.c',
+    'exp10.c', 'exp10f.c',
+    'scalbn.c', '__fpclassifyl.c',
+    '__signbitl.c', '__signbitf.c', '__signbit.c',
+    '__math_divzero.c', '__math_divzerof.c',
+    '__math_oflow.c', '__math_oflowf.c',
+    '__math_uflow.c', '__math_uflowf.c',
+    '__math_invalid.c', '__math_invalidf.c', '__math_invalidl.c',
+  ]
+  if superset or is_optz:
+    math_files += ['pow_small.c', 'log_small.c', 'log2_small.c']
+  if superset or not is_optz:
+    math_files += ['pow.c', 'pow_data.c', 'log.c', 'log_data.c', 'log2.c', 'log2_data.c']
+
+  math_files = files_in_path(path='system/lib/libc/musl/src/math', filenames=math_files)
+
   other_files = files_in_path(
     path='system/lib/libc',
     filenames=['emscripten_memcpy.c', 'emscripten_memset.c',
@@ -219,7 +241,7 @@ class Library:
   # extra code size. The -fno-unroll-loops flags was added here when loop
   # unrolling landed upstream in LLVM to avoid changing behavior but was not
   # specifically evaluated.
-  cflags = ['-Werror', '-fno-unroll-loops']
+  cflags = ['-O2', '-Werror', '-fno-unroll-loops']
 
   # A list of directories to put in the include path when building.
   # This is a list of tuples of path components.
@@ -528,6 +550,32 @@ class MTLibrary(Library):
     return super().get_default_variation(is_mt=settings.USE_PTHREADS, **kwargs)
 
 
+class DebugLibrary(Library):
+  def __init__(self, **kwargs):
+    self.is_debug = kwargs.pop('is_debug')
+    super().__init__(**kwargs)
+
+  def get_cflags(self):
+    cflags = super().get_cflags()
+    if not self.is_debug:
+      cflags += ['-DNDEBUG']
+    return cflags
+
+  def get_base_name(self):
+    name = super().get_base_name()
+    if self.is_debug:
+      name += '-debug'
+    return name
+
+  @classmethod
+  def vary_on(cls):
+    return super().vary_on() + ['is_debug']
+
+  @classmethod
+  def get_default_variation(cls, **kwargs):
+    return super().get_default_variation(is_debug=settings.ASSERTIONS, **kwargs)
+
+
 class OptimizedAggressivelyForSizeLibrary(Library):
   def __init__(self, **kwargs):
     self.is_optz = kwargs.pop('is_optz')
@@ -615,10 +663,50 @@ class NoExceptLibrary(Library):
     return super().get_default_variation(eh_mode=eh_mode, **kwargs)
 
 
+class SjLjLibrary(Library):
+  def __init__(self, **kwargs):
+    # Whether we use Wasm EH instructions for SjLj support
+    self.is_wasm = kwargs.pop('is_wasm')
+    super().__init__(**kwargs)
+
+  def get_cflags(self):
+    cflags = super().get_cflags()
+    if self.is_wasm:
+      # DISABLE_EXCEPTION_THROWING=0 is the default, which is for Emscripten
+      # EH/SjLj, so we should reverse it.
+      cflags += ['-s', 'SUPPORT_LONGJMP=wasm',
+                 '-s', 'DISABLE_EXCEPTION_THROWING=1',
+                 '-D__USING_WASM_SJLJ__']
+    else:
+      cflags += ['-s', 'SUPPORT_LONGJMP=emscripten']
+    return cflags
+
+  def get_base_name(self):
+    name = super().get_base_name()
+    # TODO Currently emscripten-based SjLj is the default mode, thus no
+    # suffixes. Change the default to wasm exception later.
+    if self.is_wasm:
+      name += '-wasm-sjlj'
+    return name
+
+  @classmethod
+  def vary_on(cls):
+    return super().vary_on() + ['is_wasm']
+
+  @classmethod
+  def get_default_variation(cls, **kwargs):
+    is_wasm = settings.SUPPORT_LONGJMP == 'wasm'
+    return super().get_default_variation(is_wasm=is_wasm, **kwargs)
+
+
 class MuslInternalLibrary(Library):
-  includes = ['system/lib/libc/musl/src/internal']
+  includes = [
+    'system/lib/libc/musl/src/internal',
+    'system/lib/libc/musl/src/include',
+  ]
 
   cflags = [
+    '-std=c99',
     '-D_XOPEN_SOURCE=700',
     '-Wno-unused-result',  # system call results are often ignored in musl, and in wasi that warns
   ]
@@ -650,13 +738,14 @@ class AsanInstrumentedLibrary(Library):
     return super().get_default_variation(is_asan=settings.USE_ASAN, **kwargs)
 
 
-class libcompiler_rt(MTLibrary):
+# Subclass of SjLjLibrary because emscripten_setjmp.c uses SjLj support
+class libcompiler_rt(MTLibrary, SjLjLibrary):
   name = 'libcompiler_rt'
   # compiler_rt files can't currently be part of LTO although we are hoping to remove this
   # restriction soon: https://reviews.llvm.org/D71738
   force_object_files = True
 
-  cflags = ['-O2', '-fno-builtin']
+  cflags = ['-fno-builtin']
   src_dir = 'system/lib/compiler-rt/lib/builtins'
   # gcc_personality_v0.c depends on libunwind, which don't include by default.
   src_files = glob_in_path(src_dir, '*.c', excludes=['gcc_personality_v0.c'])
@@ -670,7 +759,7 @@ class libcompiler_rt(MTLibrary):
       ])
 
 
-class libc(AsanInstrumentedLibrary, MuslInternalLibrary, MTLibrary):
+class libc(DebugLibrary, AsanInstrumentedLibrary, MuslInternalLibrary, MTLibrary):
   name = 'libc'
 
   # Without -fno-builtin, LLVM can optimize away or convert calls to library
@@ -681,8 +770,8 @@ class libc(AsanInstrumentedLibrary, MuslInternalLibrary, MTLibrary):
 
   # Disable certain warnings for code patterns that are contained in upstream musl
   cflags += ['-Wno-ignored-attributes',
-             '-Wno-dangling-else',
-             '-Wno-unknown-pragmas',
+             # tre.h defines NDEBUG internally itself
+             '-Wno-macro-redefined',
              '-Wno-shift-op-parentheses',
              '-Wno-string-plus-int',
              '-Wno-pointer-sign']
@@ -695,7 +784,7 @@ class libc(AsanInstrumentedLibrary, MuslInternalLibrary, MTLibrary):
     ignore = [
         'ipc', 'passwd', 'signal', 'sched', 'time', 'linux',
         'aio', 'exit', 'legacy', 'mq', 'setjmp', 'env',
-        'ldso'
+        'ldso', 'malloc'
     ]
 
     # individual files
@@ -706,9 +795,10 @@ class libc(AsanInstrumentedLibrary, MuslInternalLibrary, MTLibrary):
         'gethostbyname2_r.c', 'gethostbyname_r.c', 'gethostbyname2.c',
         'alarm.c', 'syscall.c', 'popen.c', 'pclose.c',
         'getgrouplist.c', 'initgroups.c', 'wordexp.c', 'timer_create.c',
-        'faccessat.c',
+        'getentropy.c',
         # 'process' exclusion
-        'fork.c', 'vfork.c', 'posix_spawn.c', 'posix_spawnp.c', 'execve.c', 'waitid.c', 'system.c'
+        'fork.c', 'vfork.c', 'posix_spawn.c', 'posix_spawnp.c', 'execve.c', 'waitid.c', 'system.c',
+        '_Fork.c',
     ]
 
     ignore += LIBC_SOCKETS
@@ -723,13 +813,8 @@ class libc(AsanInstrumentedLibrary, MuslInternalLibrary, MTLibrary):
         '__unmapself.c',
         # Empty files, simply ignore them.
         'syscall_cp.c', 'tls.c',
-        # TODO: Comment out (or support) within upcoming musl upgrade. See #12216.
-        # 'pthread_setname_np.c',
-        # TODO: No longer exists in the latest musl version.
-        '__futex.c',
-        # TODO: Could be supported in the upcoming musl upgrade
-        'lock_ptc.c',
-        # 'pthread_setattr_default_np.c',
+        # TODO: Support this. See #12216.
+        'pthread_setname_np.c',
         # TODO: These could be moved away from JS in the upcoming musl upgrade.
         'pthread_cancel.c',
         'pthread_join.c', 'pthread_testcancel.c',
@@ -743,6 +828,8 @@ class libc(AsanInstrumentedLibrary, MuslInternalLibrary, MTLibrary):
           'pthread_testcancel.c',
           'emscripten_proxy_main.c',
           'emscripten_thread_state.S',
+          'emscripten_futex_wait.c',
+          'emscripten_futex_wake.c',
         ])
     else:
       ignore += ['thread']
@@ -783,7 +870,7 @@ class libc(AsanInstrumentedLibrary, MuslInternalLibrary, MTLibrary):
         ])
 
     # These are included in wasm_libc_rt instead
-    ignore += [os.path.basename(f) for f in get_wasm_libc_rt_files()]
+    ignore += [os.path.basename(f) for f in get_libc_rt_files(superset=True)]
 
     ignore = set(ignore)
     # TODO: consider using more math code from musl, doing so makes box2d faster
@@ -807,11 +894,16 @@ class libc(AsanInstrumentedLibrary, MuslInternalLibrary, MTLibrary):
           'ctime.c',
           'gmtime.c',
           'localtime.c',
-          'nanosleep.c'
+          'nanosleep.c',
+          'clock_nanosleep.c',
         ])
     libc_files += files_in_path(
         path='system/lib/libc/musl/src/legacy',
         filenames=['getpagesize.c', 'err.c'])
+
+    libc_files += files_in_path(
+        path='system/lib/libc/musl/src/linux',
+        filenames=['getdents.c'])
 
     libc_files += files_in_path(
         path='system/lib/libc/musl/src/env',
@@ -836,6 +928,7 @@ class libc(AsanInstrumentedLibrary, MuslInternalLibrary, MTLibrary):
     libc_files += files_in_path(
         path='system/lib/libc/musl/src/signal',
         filenames=[
+          'block.c',
           'getitimer.c',
           'killpg.c',
           'setitimer.c',
@@ -895,7 +988,7 @@ class libprintf_long_double(libc):
 class libsockets(MuslInternalLibrary, MTLibrary):
   name = 'libsockets'
 
-  cflags = ['-Os', '-fno-builtin']
+  cflags = ['-Os', '-fno-builtin', '-Wno-shift-op-parentheses']
 
   def get_files(self):
     return files_in_path(
@@ -920,7 +1013,6 @@ class libsockets_proxy(MTLibrary):
 
 class crt1(MuslInternalLibrary):
   name = 'crt1'
-  cflags = ['-O2']
   src_dir = 'system/lib/libc'
   src_files = ['crt1.c']
 
@@ -935,7 +1027,6 @@ class crt1(MuslInternalLibrary):
 
 class crt1_reactor(MuslInternalLibrary):
   name = 'crt1_reactor'
-  cflags = ['-O2']
   src_dir = 'system/lib/libc'
   src_files = ['crt1_reactor.c']
 
@@ -950,7 +1041,7 @@ class crt1_reactor(MuslInternalLibrary):
 
 class crtbegin(Library):
   name = 'crtbegin'
-  cflags = ['-O2', '-s', 'USE_PTHREADS']
+  cflags = ['-s', 'USE_PTHREADS']
   src_dir = 'system/lib/pthread'
   src_files = ['emscripten_tls_init.c']
 
@@ -1066,7 +1157,7 @@ class libunwind(NoExceptLibrary, MTLibrary):
 class libmalloc(MTLibrary):
   name = 'libmalloc'
 
-  cflags = ['-O2', '-fno-builtin']
+  cflags = ['-fno-builtin']
 
   def __init__(self, **kwargs):
     self.malloc = kwargs.pop('malloc')
@@ -1121,6 +1212,11 @@ class libmalloc(MTLibrary):
 
   def can_use(self):
     return super().can_use() and settings.MALLOC != 'none'
+
+  def can_build(self):
+    # emmalloc is not currently compatible with 64-bit pointers.  See
+    # the comment at the top of emmalloc.c.
+    return not self.malloc.startswith('emmalloc') or not settings.MEMORY64
 
   @classmethod
   def vary_on(cls):
@@ -1217,7 +1313,7 @@ class libGL(MTLibrary):
 class libwebgpu_cpp(MTLibrary):
   name = 'libwebgpu_cpp'
 
-  cflags = ['-std=c++11', '-O2']
+  cflags = ['-std=c++11']
   src_dir = 'system/lib/webgpu'
   src_files = ['webgpu_cpp.cpp']
 
@@ -1284,17 +1380,17 @@ class libasmfs(MTLibrary):
     return True
 
 
-class libwasmfs(MTLibrary):
+class libwasmfs(MTLibrary, DebugLibrary, AsanInstrumentedLibrary):
   name = 'libwasmfs'
 
-  cflags = ['-fno-exceptions']
+  cflags = ['-fno-exceptions', '-std=c++17']
 
   def get_files(self):
     return files_in_path(
         path='system/lib/wasmfs',
-        filenames=['wasmfs.cpp', 'file_table.cpp', 'file.cpp'])
+        filenames=['syscalls.cpp', 'file_table.cpp', 'file.cpp', 'wasmfs.cpp', 'streams.cpp', 'memory_file.cpp', 'memory_file_backend.cpp', 'js_file_backend.cpp', 'proxied_file_backend.cpp'])
 
-  def can_build(self):
+  def can_use(self):
     return settings.WASMFS
 
 
@@ -1307,21 +1403,21 @@ class libhtml5(Library):
 
 
 class CompilerRTLibrary(Library):
-  cflags = ['-O2', '-fno-builtin']
+  cflags = ['-fno-builtin']
   # compiler_rt files can't currently be part of LTO although we are hoping to remove this
   # restriction soon: https://reviews.llvm.org/D71738
   force_object_files = True
 
 
-class libc_rt_wasm(OptimizedAggressivelyForSizeLibrary, AsanInstrumentedLibrary, CompilerRTLibrary, MuslInternalLibrary, MTLibrary):
-  name = 'libc_rt_wasm'
+class libc_rt(OptimizedAggressivelyForSizeLibrary, AsanInstrumentedLibrary, CompilerRTLibrary, MuslInternalLibrary, MTLibrary):
+  name = 'libc_rt'
 
   def get_files(self):
-    return get_wasm_libc_rt_files()
+    return get_libc_rt_files(is_optz=self.is_optz)
 
 
-class libubsan_minimal_rt_wasm(CompilerRTLibrary, MTLibrary):
-  name = 'libubsan_minimal_rt_wasm'
+class libubsan_minimal_rt(CompilerRTLibrary, MTLibrary):
+  name = 'libubsan_minimal_rt'
   never_force = True
 
   includes = ['system/lib/compiler-rt/lib']
@@ -1474,37 +1570,10 @@ class libjsmath(Library):
     return super(libjsmath, self).can_use() and settings.JS_MATH
 
 
-class libstubs(Library):
+class libstubs(DebugLibrary):
   name = 'libstubs'
-  cflags = ['-O2']
   src_dir = 'system/lib/libc'
   src_files = ['emscripten_syscall_stubs.c', 'emscripten_libc_stubs.c']
-
-  def __init__(self, **kwargs):
-    self.is_debug = kwargs.pop('is_debug')
-    super().__init__(**kwargs)
-
-  def get_base_name(self):
-    name = super().get_base_name()
-    if self.is_debug:
-      name += '-debug'
-    return name
-
-  def get_cflags(self):
-    cflags = super().get_cflags()
-    if self.is_debug:
-      cflags += ['-UNDEBUG']
-    else:
-      cflags += ['-DNDEBUG']
-    return cflags
-
-  @classmethod
-  def vary_on(cls):
-    return super().vary_on() + ['is_debug']
-
-  @classmethod
-  def get_default_variation(cls, **kwargs):
-    return super().get_default_variation(is_debug=settings.ASSERTIONS, **kwargs)
 
 
 # If main() is not in EXPORTED_FUNCTIONS, it may be dce'd out. This can be
@@ -1528,7 +1597,7 @@ def handle_reverse_deps(input_files):
     # than scanning the input files
     for symbols in deps_info.get_deps_info().values():
       for symbol in symbols:
-        settings.EXPORTED_FUNCTIONS.append(mangle_c_symbol_name(symbol))
+        settings.REQUIRED_EXPORTS.append(symbol)
     return
 
   if settings.REVERSE_DEPS != 'auto':
@@ -1545,7 +1614,7 @@ def handle_reverse_deps(input_files):
         for dep in deps:
           need['undefs'].add(dep)
           logger.debug('adding dependency on %s due to deps-info on %s' % (dep, ident))
-          settings.EXPORTED_FUNCTIONS.append(mangle_c_symbol_name(dep))
+          settings.REQUIRED_EXPORTS.append(dep)
     if more:
       add_reverse_deps(need) # recurse to get deps of deps
 
@@ -1581,6 +1650,7 @@ def calculate(input_files, forced):
 
   handle_reverse_deps(input_files)
 
+  force_include = []
   libs_to_link = []
   already_included = set()
   system_libs_map = Library.get_usable_variations()
@@ -1592,8 +1662,10 @@ def calculate(input_files, forced):
   # ones you want
   force = os.environ.get('EMCC_FORCE_STDLIBS')
   if force == '1':
-    force = ','.join(name for name, lib in system_libs_map.items() if not lib.never_force)
-  force_include = set((force.split(',') if force else []) + forced)
+    force_include = [name for name, lib in system_libs_map.items() if not lib.never_force]
+  elif force is not None:
+    force_include = force.split(',')
+  force_include += forced
   if force_include:
     logger.debug(f'forcing stdlibs: {force_include}')
 
@@ -1626,7 +1698,7 @@ def calculate(input_files, forced):
     add_library(forced)
 
   if only_forced:
-    add_library('libc_rt_wasm')
+    add_library('libc_rt')
     add_library('libcompiler_rt')
   else:
     if settings.AUTO_NATIVE_LIBRARIES:
@@ -1659,19 +1731,19 @@ def calculate(input_files, forced):
       add_library('libmalloc')
     if settings.STANDALONE_WASM:
       add_library('libstandalonewasm')
-    add_library('libc_rt_wasm')
+    add_library('libc_rt')
 
     if settings.USE_LSAN:
-      force_include.add('liblsan_rt')
+      force_include.append('liblsan_rt')
       add_library('liblsan_rt')
 
     if settings.USE_ASAN:
-      force_include.add('libasan_rt')
+      force_include.append('libasan_rt')
       add_library('libasan_rt')
       add_library('libasan_js')
 
     if settings.UBSAN_RUNTIME == 1:
-      add_library('libubsan_minimal_rt_wasm')
+      add_library('libubsan_minimal_rt')
     elif settings.UBSAN_RUNTIME == 2:
       add_library('libubsan_rt')
 
@@ -1680,14 +1752,6 @@ def calculate(input_files, forced):
 
     if sanitize:
       add_library('libsanitizer_common_rt')
-
-    # the sanitizer runtimes may call mmap, which will need a few things. sadly
-    # the usual deps_info mechanism does not work since we scan only user files
-    # for things, and not libraries (to be able to scan libraries, we'd need to
-    # somehow figure out which of their object files will actually be linked in -
-    # but only lld knows that). so just directly handle that here.
-    if sanitize:
-      settings.EXPORTED_FUNCTIONS.append(mangle_c_symbol_name('memset'))
 
     if settings.PROXY_POSIX_SOCKETS:
       add_library('libsockets_proxy')

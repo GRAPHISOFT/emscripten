@@ -29,19 +29,21 @@ variables so that emcc etc. are used. Typical usage:
   def has_substr(args, substr):
     return any(substr in s for s in args)
 
-  # Insert arg for the Emscripten toolchain file if the user didn't specify one.
-  # User specified arguments come afterwards so they can overwrite variables defined in toolchain file.
+  # Append the Emscripten toolchain file if the user didn't specify one.
   if not has_substr(args, '-DCMAKE_TOOLCHAIN_FILE'):
-    args.insert(1, '-DCMAKE_TOOLCHAIN_FILE=' + utils.path_from_root('cmake/Modules/Platform/Emscripten.cmake'))
+    args.append('-DCMAKE_TOOLCHAIN_FILE=' + utils.path_from_root('cmake/Modules/Platform/Emscripten.cmake'))
 
   if not has_substr(args, '-DCMAKE_CROSSCOMPILING_EMULATOR'):
     node_js = config.NODE_JS[0]
-    args.insert(1, f'-DCMAKE_CROSSCOMPILING_EMULATOR={node_js}')
+    # In order to allow cmake to run code built with pthreads we need to pass some extra flags to node.
+    # Note that we also need --experimental-wasm-bulk-memory which is true by default and hence not added here
+    # See https://github.com/emscripten-core/emscripten/issues/15522
+    args.append(f'-DCMAKE_CROSSCOMPILING_EMULATOR={node_js};--experimental-wasm-threads')
 
   # On Windows specify MinGW Makefiles or ninja if we have them and no other
   # toolchain was specified, to keep CMake from pulling in a native Visual
   # Studio, or Unix Makefiles.
-  if utils.WINDOWS and '-G' not in args:
+  if utils.WINDOWS and not any(arg.startswith('-G') for arg in args):
     if utils.which('mingw32-make'):
       args += ['-G', 'MinGW Makefiles']
     elif utils.which('ninja'):

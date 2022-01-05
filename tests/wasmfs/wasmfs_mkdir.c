@@ -21,8 +21,24 @@ int main() {
   // Try to make a directory under the root directory.
   errno = 0;
   mkdir("/working", 0777);
+  mkdir("/foobar", 01777);
   printf("Errno: %s\n", strerror(errno));
   assert(errno == 0);
+
+  // Check that the file type is correct on mode (0777 = S_IRWXUGO)
+  int fdStat = open("/working", O_RDONLY | O_DIRECTORY);
+  struct stat directory;
+  fstat(fdStat, &directory);
+  assert((directory.st_mode & S_IFMT) == S_IFDIR);
+  assert(directory.st_mode == (S_IRWXUGO | S_IFDIR));
+  close(fdStat);
+
+  // Check that the file type is correct on mode (01777 = S_ISVTX | S_IRWXUGO)
+  int fdStat2 = open("/foobar", O_RDONLY | O_DIRECTORY);
+  struct stat directory2;
+  fstat(fdStat2, &directory2);
+  assert(directory2.st_mode == (S_IRWXUGO | S_ISVTX | S_IFDIR));
+  close(fdStat2);
 
   // Try to create a file in the same directory.
   int fd = open("/working/test", O_RDWR | O_CREAT, 0777);
@@ -42,11 +58,16 @@ int main() {
   printf("%s", buf);
   close(fd);
 
-  // Try to make a directory with an empty pathname.
+  // In Linux and WasmFS, an empty pathname returns ENOENT.
   errno = 0;
   mkdir("", 0777);
-  printf("Errno: %s\n", strerror(errno));
+  // in Linux and WasmFS, an empty pathname should return ENOENT.
+  // In the JS File system this returns EINVAL.
+#ifdef WASMFS
+  assert(errno == ENOENT);
+#else
   assert(errno == EINVAL);
+#endif
 
   // Try to make the root directory.
   errno = 0;
@@ -85,6 +106,20 @@ int main() {
   mkdir("/working/new-directory", 0777);
   printf("Errno: %s\n", strerror(errno));
   assert(errno == 0);
+
+  // Try to make a directory with a name that is longer than WASMFS_NAME_MAX.
+  // In Linux, creating a directory with a name that is longer than 255
+  // characters returns ENAMETOOLONG.
+  errno = 0;
+  mkdir("/working/"
+        "0000000001000000000200000000030000000004000000000500000000060000000007"
+        "0000000008000000000900000000000000000001000000000200000000030000000004"
+        "0000000005000000000600000000070000000008000000000900000000000000000001"
+        "0000000002000000000300000000040000000005123456",
+        0777);
+#ifdef WASMFS
+  assert(errno == ENAMETOOLONG);
+#endif
 
   return 0;
 }

@@ -24,17 +24,11 @@ from tools.settings import settings
 import emscripten
 
 
-SYSTEM_LIBRARIES = system_libs.Library.get_all_variations()
-SYSTEM_TASKS = list(SYSTEM_LIBRARIES.keys())
-
-# This is needed to build the generated_struct_info.json file.
-# It is not a system library, but it needs to be built before running with FROZEN_CACHE.
-SYSTEM_TASKS += ['struct_info']
-
-# Minimal subset of SYSTEM_TASKS used by CI systems to build enough to useful
+# Minimal subset of targets used by CI systems to build enough to useful
 MINIMAL_TASKS = [
     'libcompiler_rt',
     'libc',
+    'libc-debug',
     'libc++abi',
     'libc++abi-except',
     'libc++abi-noexcept',
@@ -54,21 +48,22 @@ MINIMAL_TASKS = [
     'libsockets',
     'libstubs',
     'libstubs-debug',
-    'libc_rt_wasm',
-    'libc_rt_wasm-optz',
+    'libc_rt',
+    'libc_rt-optz',
     'struct_info',
     'libstandalonewasm',
     'crt1',
     'libunwind-except'
 ]
 
-# Variant builds that we want to support for cetain ports
+# Variant builds that we want to support for certain ports
 # TODO: It would be nice if the ports themselves could specify the variants that they
 # support.
 PORT_VARIANTS = {
     'regal-mt': ('regal', {'USE_PTHREADS': 1}),
     'harfbuzz-mt': ('harfbuzz', {'USE_PTHREADS': 1}),
     'sdl2-mt': ('sdl2', {'USE_PTHREADS': 1}),
+    'icu-mt': ('icu', {'USE_PTHREADS': 1}),
     'sdl2_mixer_mp3': ('sdl2_mixer', {'SDL2_MIXER_FORMATS': ["mp3"]}),
     'sdl2_mixer_none': ('sdl2_mixer', {'SDL2_MIXER_FORMATS': []}),
     'sdl2_image_png': ('sdl2_image', {'SDL2_IMAGE_FORMATS': ["png"]}),
@@ -79,22 +74,25 @@ PORTS = sorted(list(ports.ports_by_name.keys()) + list(PORT_VARIANTS.keys()))
 
 temp_files = shared.configuration.get_temp_files()
 logger = logging.getLogger('embuilder')
-force = False
 legacy_prefixes = {
   'libgl': 'libGL',
 }
 
 
 def get_help():
-  all_tasks = SYSTEM_TASKS + PORTS
+  all_tasks = get_system_tasks()[1] + PORTS
   all_tasks.sort()
   return '''
 Available targets:
 
-  build %s
+  build / clear %s
 
-Issuing 'embuilder.py build ALL' causes each task to be built.
+Issuing 'embuilder build ALL' causes each task to be built.
 ''' % '\n        '.join(all_tasks)
+
+
+def clear_port(port_name):
+  ports.clear_port(port_name, settings)
 
 
 def build_port(port_name):
@@ -106,17 +104,23 @@ def build_port(port_name):
   else:
     old_settings = None
 
-  if force:
-    ports.clear_port(port_name, settings)
-
   ports.build_port(port_name, settings)
   if old_settings:
     settings.dict().update(old_settings)
 
 
-def main():
-  global force
+def get_system_tasks():
+  system_libraries = system_libs.Library.get_all_variations()
+  system_tasks = list(system_libraries.keys())
+  # This is needed to build the generated_struct_info.json file.
+  # It is not a system library, but it needs to be built before
+  # running with FROZEN_CACHE.
+  system_tasks += ['struct_info']
 
+  return system_libraries, system_tasks
+
+
+def main():
   all_build_start_time = time.time()
 
   parser = argparse.ArgumentParser(description=__doc__,
@@ -129,11 +133,11 @@ def main():
                       help='force rebuild of target (by removing it first)')
   parser.add_argument('--wasm64', action='store_true',
                       help='use wasm64 architecture')
-  parser.add_argument('operation', help='currently only "build" is supported')
+  parser.add_argument('operation', help='currently only "build" and "clear" are supported')
   parser.add_argument('targets', nargs='+', help='see below')
   args = parser.parse_args()
 
-  if args.operation != 'build':
+  if args.operation not in ('build', 'clear'):
     shared.exit_with_error('unfamiliar operation: ' + args.operation)
 
   # process flags
@@ -151,15 +155,19 @@ def main():
 
   if args.wasm64:
     settings.MEMORY64 = 2
+    MINIMAL_TASKS[:] = [t for t in MINIMAL_TASKS if 'emmalloc' not in t]
 
+  do_build = args.operation == 'build'
+  do_clear = args.operation == 'clear'
   if args.force:
-    force = True
+    do_clear = True
 
   # process tasks
   auto_tasks = False
   tasks = args.targets
+  system_libraries, system_tasks = get_system_tasks()
   if 'SYSTEM' in tasks:
-    tasks = SYSTEM_TASKS
+    tasks = system_tasks
     auto_tasks = True
   elif 'USER' in tasks:
     tasks = PORTS
@@ -168,7 +176,7 @@ def main():
     tasks = MINIMAL_TASKS
     auto_tasks = True
   elif 'ALL' in tasks:
-    tasks = SYSTEM_TASKS + PORTS
+    tasks = system_tasks + PORTS
     auto_tasks = True
   if auto_tasks:
     # cocos2d: must be ported, errors on
@@ -180,23 +188,32 @@ def main():
     for old, new in legacy_prefixes.items():
       if what.startswith(old):
         what = what.replace(old, new)
-    logger.info('building and verifying ' + what)
+    if do_build:
+      logger.info('building ' + what)
+    else:
+      logger.info('clearing ' + what)
     start_time = time.time()
-    if what in SYSTEM_LIBRARIES:
-      library = SYSTEM_LIBRARIES[what]
-      if force:
+    if what in system_libraries:
+      library = system_libraries[what]
+      if do_clear:
         library.erase()
-      library.get_path()
+      if do_build:
+        library.get_path()
     elif what == 'sysroot':
-      if force:
+      if do_clear:
         shared.Cache.erase_file('sysroot_install.stamp')
-      system_libs.ensure_sysroot()
+      if do_build:
+        system_libs.ensure_sysroot()
     elif what == 'struct_info':
-      if force:
-        shared.Cache.erase_file('generated_struct_info' + ('64' if settings.MEMORY64 else '32') + '.json')
-      emscripten.generate_struct_info()
+      if do_clear:
+        emscripten.clear_struct_info()
+      if do_build:
+        emscripten.generate_struct_info()
     elif what in PORTS:
-      build_port(what)
+      if do_clear:
+        clear_port(what)
+      if do_build:
+        build_port(what)
     else:
       logger.error('unfamiliar build target: ' + what)
       return 1
